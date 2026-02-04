@@ -39,7 +39,7 @@ app.add_middleware(
 # ============ Configuration ============
 
 # GPU Worker URL - VoiceClaw XTTS Worker
-XTTS_WORKER_URL = os.getenv("XTTS_WORKER_URL", "http://34.172.222.123:8080")
+XTTS_WORKER_URL = os.getenv("XTTS_WORKER_URL", "https://jason-coupon-exact-queue.trycloudflare.com")
 XTTS_TIMEOUT = int(os.getenv("XTTS_TIMEOUT", "60"))  # seconds
 
 # ============ Models ============
