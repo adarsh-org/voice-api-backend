@@ -1,12 +1,12 @@
 """
 Voice API Backend
 FastAPI server for voice synthesis and cloning.
-GPU inference endpoints are placeholders until GCP is set up.
+Integrates with VoiceClaw GPU Worker for XTTS inference.
 """
 
 from fastapi import FastAPI, HTTPException, Depends, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from pydantic import BaseModel, Field
 from typing import Optional, List
 from datetime import datetime
@@ -14,11 +14,17 @@ import uuid
 import os
 import hashlib
 import time
+import httpx
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Voice API",
     description="AI Voice Synthesis & Cloning API",
-    version="0.1.0"
+    version="0.2.0"
 )
 
 # CORS
@@ -30,13 +36,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ============ Configuration ============
+
+# GPU Worker URL - VoiceClaw XTTS Worker
+XTTS_WORKER_URL = os.getenv("XTTS_WORKER_URL", "http://34.172.222.123:8080")
+XTTS_TIMEOUT = int(os.getenv("XTTS_TIMEOUT", "60"))  # seconds
+
 # ============ Models ============
 
 class GenerateRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=5000, description="Text to synthesize")
     voice_id: str = Field(..., description="Voice ID to use")
     speed: float = Field(default=1.0, ge=0.5, le=2.0, description="Speech speed multiplier")
-    format: str = Field(default="mp3", pattern="^(mp3|wav|ogg)$", description="Output format")
+    format: str = Field(default="wav", pattern="^(mp3|wav|ogg)$", description="Output format")
+    language: str = Field(default="en", description="Language code for synthesis")
 
 class GenerateResponse(BaseModel):
     id: str
@@ -54,10 +67,10 @@ class VoiceCloneRequest(BaseModel):
 class Voice(BaseModel):
     id: str
     name: str
-    description: Optional[str]
+    description: Optional[str] = None
     language: str
     gender: str
-    preview_url: Optional[str]
+    preview_url: Optional[str] = None
     is_cloned: bool
     created_at: str
 
@@ -77,45 +90,72 @@ class APIKey(BaseModel):
 
 # ============ Mock Data ============
 
-MOCK_VOICES = [
-    Voice(
-        id="voice_alloy",
-        name="Alloy",
-        description="Neutral and balanced voice",
-        language="en",
-        gender="neutral",
-        preview_url=None,
-        is_cloned=False,
-        created_at="2026-01-01T00:00:00Z"
-    ),
-    Voice(
-        id="voice_echo",
-        name="Echo",
-        description="Warm and friendly male voice",
-        language="en",
-        gender="male",
-        preview_url=None,
-        is_cloned=False,
-        created_at="2026-01-01T00:00:00Z"
-    ),
-    Voice(
-        id="voice_nova",
-        name="Nova",
-        description="Energetic female voice",
-        language="en",
-        gender="female",
-        preview_url=None,
-        is_cloned=False,
-        created_at="2026-01-01T00:00:00Z"
-    ),
-]
-
 MOCK_USAGE = {
     "characters_used": 12450,
     "characters_limit": 100000,
     "requests_count": 156,
     "voices_count": 3
 }
+
+# ============ GPU Worker Client ============
+
+async def get_gpu_worker_health() -> dict:
+    """Check GPU worker health."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{XTTS_WORKER_URL}/health")
+            if response.status_code == 200:
+                return response.json()
+    except Exception as e:
+        logger.error(f"GPU worker health check failed: {e}")
+    return {"status": "unavailable", "gpu_available": False}
+
+async def get_gpu_worker_voices() -> List[dict]:
+    """Fetch voices from GPU worker."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.get(f"{XTTS_WORKER_URL}/v1/voices")
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("voices", [])
+    except Exception as e:
+        logger.error(f"Failed to fetch GPU worker voices: {e}")
+    return []
+
+async def synthesize_with_gpu_worker(text: str, voice_id: str, language: str = "en", speed: float = 1.0) -> Optional[bytes]:
+    """
+    Call GPU worker to synthesize speech.
+    Returns WAV audio bytes or None on failure.
+    """
+    try:
+        payload = {
+            "text": text,
+            "voice_id": voice_id,
+            "language": language,
+            "speed": speed
+        }
+        
+        logger.info(f"Calling GPU worker: {XTTS_WORKER_URL}/v1/synthesize/stream")
+        logger.info(f"Payload: {payload}")
+        
+        async with httpx.AsyncClient(timeout=XTTS_TIMEOUT) as client:
+            response = await client.post(
+                f"{XTTS_WORKER_URL}/v1/synthesize/stream",
+                json=payload
+            )
+            
+            if response.status_code == 200:
+                return response.content
+            else:
+                logger.error(f"GPU worker returned {response.status_code}: {response.text}")
+                return None
+                
+    except httpx.TimeoutException:
+        logger.error(f"GPU worker request timed out after {XTTS_TIMEOUT}s")
+        return None
+    except Exception as e:
+        logger.error(f"GPU worker synthesis failed: {e}")
+        return None
 
 # ============ Auth ============
 
@@ -137,60 +177,158 @@ async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
 async def root():
     return {
         "name": "Voice API",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "status": "operational",
-        "docs": "/docs"
+        "docs": "/docs",
+        "gpu_worker": XTTS_WORKER_URL
     }
 
 @app.get("/health")
 async def health():
+    """Health check including GPU worker status."""
+    gpu_health = await get_gpu_worker_health()
+    
     return {
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
-        "gpu_available": False,  # Will be True when GCP is connected
-        "version": "0.1.0"
+        "version": "0.2.0",
+        "gpu_worker": {
+            "url": XTTS_WORKER_URL,
+            "status": gpu_health.get("status", "unknown"),
+            "gpu_available": gpu_health.get("gpu_available", False),
+            "gpu_name": gpu_health.get("gpu_name"),
+            "tts_model_loaded": gpu_health.get("tts_model_loaded", False)
+        }
     }
 
 # ---- Voice Generation ----
 
-@app.post("/v1/voice/generate", response_model=GenerateResponse)
+@app.post("/v1/voice/generate")
 async def generate_voice(
     request: GenerateRequest,
     api_key: str = Depends(verify_api_key)
 ):
     """
-    Generate speech from text.
-    
-    Currently returns a placeholder. Real inference coming with GCP GPU.
+    Generate speech from text using GPU worker.
+    Returns WAV audio directly.
     """
     request_id = f"gen_{uuid.uuid4().hex[:12]}"
     
-    # Validate voice exists
-    voice_ids = [v.id for v in MOCK_VOICES]
-    if request.voice_id not in voice_ids:
-        raise HTTPException(status_code=404, detail=f"Voice '{request.voice_id}' not found")
+    logger.info(f"[{request_id}] Generate request: voice={request.voice_id}, text_len={len(request.text)}")
     
-    # Placeholder response - would actually call GPU worker
+    # Call GPU worker
+    audio_data = await synthesize_with_gpu_worker(
+        text=request.text,
+        voice_id=request.voice_id,
+        language=request.language,
+        speed=request.speed
+    )
+    
+    if audio_data is None:
+        logger.error(f"[{request_id}] GPU worker failed, returning error")
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "synthesis_failed",
+                "message": "GPU worker unavailable or synthesis failed. Please try again.",
+                "request_id": request_id
+            }
+        )
+    
+    logger.info(f"[{request_id}] Synthesis successful, returning {len(audio_data)} bytes")
+    
+    # Return audio directly as WAV
+    return Response(
+        content=audio_data,
+        media_type="audio/wav",
+        headers={
+            "X-Request-ID": request_id,
+            "X-Characters": str(len(request.text)),
+            "Content-Disposition": f'attachment; filename="{request_id}.wav"'
+        }
+    )
+
+@app.post("/v1/voice/generate/json", response_model=GenerateResponse)
+async def generate_voice_json(
+    request: GenerateRequest,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Generate speech from text - returns JSON metadata.
+    For clients that need structured response (audio returned as base64 in future).
+    """
+    request_id = f"gen_{uuid.uuid4().hex[:12]}"
+    
+    # Call GPU worker
+    audio_data = await synthesize_with_gpu_worker(
+        text=request.text,
+        voice_id=request.voice_id,
+        language=request.language,
+        speed=request.speed
+    )
+    
+    if audio_data is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "synthesis_failed", 
+                "message": "GPU worker unavailable or synthesis failed",
+                "request_id": request_id
+            }
+        )
+    
+    # Estimate duration (WAV at 24kHz, 16-bit mono = 48000 bytes/sec)
+    duration_ms = int((len(audio_data) / 48000) * 1000)
+    
     return GenerateResponse(
         id=request_id,
-        status="completed",  # In real impl: "processing" then webhook/poll
-        audio_url=f"https://api.voiceapi.dev/audio/{request_id}.{request.format}",
-        duration_ms=len(request.text) * 60,  # Rough estimate: 60ms per char
+        status="completed",
+        audio_url=None,  # Could upload to storage and return URL
+        duration_ms=duration_ms,
         characters=len(request.text),
         created_at=datetime.utcnow().isoformat()
     )
 
 # ---- Voices ----
 
-@app.get("/v1/voices", response_model=List[Voice])
+@app.get("/v1/voices")
 async def list_voices(
     api_key: str = Depends(verify_api_key),
     include_cloned: bool = True
 ):
-    """List available voices."""
-    if include_cloned:
-        return MOCK_VOICES
-    return [v for v in MOCK_VOICES if not v.is_cloned]
+    """List available voices from GPU worker."""
+    gpu_voices = await get_gpu_worker_voices()
+    
+    if not gpu_voices:
+        # Fallback to built-in voices if GPU worker unavailable
+        return [
+            Voice(
+                id="ana_florence",
+                name="Ana Florence",
+                description="Default XTTS voice - clear female voice",
+                language="multi",
+                gender="female",
+                preview_url=None,
+                is_cloned=False,
+                created_at="2026-01-01T00:00:00Z"
+            )
+        ]
+    
+    # Transform GPU worker voices to our format
+    voices = []
+    for v in gpu_voices:
+        voices.append(Voice(
+            id=v.get("id"),
+            name=v.get("name"),
+            description=f"XTTS voice - {v.get('language', 'multi')}",
+            language=v.get("language", "multi"),
+            gender=v.get("gender", "unknown"),
+            preview_url=None,
+            is_cloned=False,
+            created_at="2026-01-01T00:00:00Z"
+        ))
+    
+    return voices
 
 @app.get("/v1/voices/{voice_id}", response_model=Voice)
 async def get_voice(
@@ -198,9 +336,21 @@ async def get_voice(
     api_key: str = Depends(verify_api_key)
 ):
     """Get details of a specific voice."""
-    for voice in MOCK_VOICES:
-        if voice.id == voice_id:
-            return voice
+    gpu_voices = await get_gpu_worker_voices()
+    
+    for v in gpu_voices:
+        if v.get("id") == voice_id:
+            return Voice(
+                id=v.get("id"),
+                name=v.get("name"),
+                description=f"XTTS voice - {v.get('language', 'multi')}",
+                language=v.get("language", "multi"),
+                gender=v.get("gender", "unknown"),
+                preview_url=None,
+                is_cloned=False,
+                created_at="2026-01-01T00:00:00Z"
+            )
+    
     raise HTTPException(status_code=404, detail="Voice not found")
 
 @app.post("/v1/voices/clone", response_model=Voice)
@@ -233,15 +383,8 @@ async def delete_voice(
     api_key: str = Depends(verify_api_key)
 ):
     """Delete a cloned voice."""
-    # Check if voice exists and is cloned
-    for voice in MOCK_VOICES:
-        if voice.id == voice_id:
-            if not voice.is_cloned:
-                raise HTTPException(status_code=400, detail="Cannot delete built-in voices")
-            # Would delete from DB here
-            return {"status": "deleted", "voice_id": voice_id}
-    
-    raise HTTPException(status_code=404, detail="Voice not found")
+    # Would check if voice is cloned and delete from storage
+    return {"status": "deleted", "voice_id": voice_id}
 
 # ---- Usage ----
 
@@ -269,7 +412,6 @@ async def list_api_keys(
     api_key: str = Depends(verify_api_key)
 ):
     """List API keys for the authenticated user."""
-    # Placeholder - would fetch from DB
     return [
         APIKey(
             key="va_****" + api_key[-4:],
@@ -298,6 +440,7 @@ async def create_api_key(
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {exc}")
     return JSONResponse(
         status_code=500,
         content={
